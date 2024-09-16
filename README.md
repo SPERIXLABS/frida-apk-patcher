@@ -72,6 +72,20 @@ After the tool finishes running, it will output the patched APK file as `your-ap
 
 - The patched APK file will be created in the current working directory as `app_name-appmon.apk`.
 
+
+## Usage
+- Over USB
+
+```
+frida -U Gadget -l [frida_script]
+```
+
+- Specific Device
+
+```
+frida Gadget -l [frida_script] -D [device_name]
+```
+
 ## Troubleshooting
 
 - **Signing Errors**: Ensure you have the correct Java Development Kit (JDK) installed and set up. The signing process uses `apksigner`, which requires the keystore and password (`appmon.keystore` and `pass:appmon` in this case) to sign the APK.
