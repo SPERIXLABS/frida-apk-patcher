@@ -25,21 +25,27 @@ import subprocess
 import sys
 import traceback
 from xml.etree import ElementTree
+import re
+
+
+def find_smali_folders(root_folder: str) -> list:
+    # Regular expression to match folder names like smali, smali_classes2, smali_classes3, etc.
+    smali_pattern = re.compile(r'^smali(_classes\d+)?$')
+
+    smali_folders = []
+
+    # Walk through the directory tree
+    for root, dirs, files in os.walk(root_folder):
+        for dir_name in dirs:
+            if smali_pattern.match(dir_name):
+                smali_folders.append(os.path.join(root, dir_name))
+
+    return smali_folders
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--apk', action='store', dest='apk_path', default='', help='''(absolute) path to APK''')
-parser.add_argument('-v', action='version', version='AppMon APK Builder v0.1, Copyright 2016 Nishant Das Patnaik')
-
-print("""
-     ___      .______   .______   .___  ___.   ______   .__   __. 
-    /   \     |   _  \  |   _  \  |   \/   |  /  __  \  |  \ |  | 
-   /  ^  \    |  |_)  | |  |_)  | |  \  /  | |  |  |  | |   \|  | 
-  /  /_\  \   |   ___/  |   ___/  |  |\/|  | |  |  |  | |  . `  | 
- /  _____  \  |  |      |  |      |  |  |  | |  `--'  | |  |\   | 
-/__/     \__\ | _|      | _|      |__|  |__|  \______/  |__| \__| 
-					    github.com/dpnishant
-                                                                  
-""")
+parser.add_argument('-v', action='version', version='APK Builder v0.1')
 
 if len(sys.argv) < 3:
     parser.print_help()
@@ -52,10 +58,10 @@ aligned_apk_path = ""
 renamed_apk_path = ""
 
 if not os.path.isfile(apk_path):
-    print("[E] File doesn't exist: %s\n[*] Quitting!" % (apk_path))
+    print("[E] File doesn't exist: %s\n[*] Quitting!" % apk_path)
     sys.exit(1)
 
-SMALI_DIRECT_METHODS = """    .method static constructor <clinit>()V
+SMALI_DIRECT_METHODS = """\n.method static constructor <clinit>()V
     .locals 1
 
     .prologue
@@ -68,7 +74,7 @@ SMALI_DIRECT_METHODS = """    .method static constructor <clinit>()V
 
 """
 
-SMALI_PROLOGUE = """    const-string v0, "frida-gadget"
+SMALI_PROLOGUE = """\n    const-string v0, "frida-gadget"
 
     invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
 
@@ -105,15 +111,26 @@ try:
     except IndexError:
         print("No launchable activity found")
         sys.exit(1)
-    launchable_activity_path = os.path.join(WORK_DIR, package_name, "smali",
-                                            launchable_activity.replace(".", "/") + ".smali")
 
     new_apk_path = WORK_DIR + "/" + package_name + ".apk"
     subprocess.call(["cp", apk_path, new_apk_path])
-    subprocess.call(["apktool", "-q", "d", new_apk_path])
+    subprocess.call(["apktool", "-q", "-f", "d", new_apk_path])
     subprocess.call(["mv", package_name, WORK_DIR])
 
-    if not "uses-permission: name='android.permission.INTERNET'" in apk_permissions:
+    # support for multi-dex
+    smali_class_folders = find_smali_folders(os.path.join(WORK_DIR, package_name))
+    launchable_activity_path = None
+    for smali_class_folder in smali_class_folders:
+        launchable_activity_smali_path = os.path.join(smali_class_folder,
+                                                      launchable_activity.replace(".", "/") + ".smali")
+        if os.path.isfile(launchable_activity_smali_path):
+            launchable_activity_path = launchable_activity_smali_path
+
+    if launchable_activity_path is None:
+        print("No launchable activity found")
+        sys.exit(1)
+
+    if "uses-permission: name='android.permission.INTERNET'" not in apk_permissions:
         print("[I] APK needs INTERNET permission")
         with codecs.open(manifest_file_path, 'r', 'utf-8') as f:
             manifest_file_contents = f.readlines()
@@ -144,9 +161,9 @@ try:
 
         tree = ElementTree.parse(manifest_file_path)
         if tree is not None:
-            root = tree.getroot()
-            if root is not None:
-                application = root.find("application")
+            tree_root = tree.getroot()
+            if tree_root is not None:
+                application = tree_root.find("application")
                 application.set("{http://schemas.android.com/apk/res/android}networkSecurityConfig",
                                 "@xml/network_security_config")
                 application.set("{http://schemas.android.com/apk/res/android}extractNativeLibs",
@@ -154,7 +171,7 @@ try:
 
                 with open(manifest_file_path, "wb") as xml_file:
                     xml_file.write('<?xml version="1.0" encoding="utf-8" standalone="no"?>'.encode())
-                    xml_file.write(ElementTree.tostring(root))
+                    xml_file.write(ElementTree.tostring(tree_root))
 
     print("[I] Searching .smali")
     with codecs.open(launchable_activity_path, 'r', 'utf-8') as f:
@@ -172,14 +189,14 @@ try:
         for cursor in range(marker, method_end):
             if ".method static constructor <clinit>()V" in file_contents[cursor]:
                 constructor_start = cursor
-                marker = constructor_start + 1
+                marker = constructor_start - 1
                 break
         for cursor in range(marker, method_end):
             if ".end method" in file_contents[cursor]:
-                constructor_end = cursor + 1
+                constructor_end = cursor - 1
                 break
         for cursor in range(marker, constructor_end):
-            if ".prologue" in file_contents[cursor]:
+            if ".locals" in file_contents[cursor] or ".prologue" in file_contents[cursor]:
                 prologue_start = cursor
                 marker = cursor + 1
 
@@ -223,7 +240,7 @@ try:
 
     align_verify = subprocess.check_output(["zipalign", "-v", "-c", "4", aligned_apk_path]).decode()
     align_verify.strip(" \r\n\t")
-    if not "Verification succesful" in align_verify:
+    if "Verification succesful" not in align_verify:
         print("[E] alignment verification failed")
     else:
         print("[I] APK alignment verified")
@@ -234,12 +251,12 @@ try:
         ["apksigner", "sign", "--verbose", "--ks", "appmon.keystore", "--ks-pass", "pass:appmon", "--out",
          signed_apk_path, aligned_apk_path]).decode()
 
-    if not "Signed" in sign_status:
-        print("[E] APK signing error %s" % (sign_status))
+    if "Signed" not in sign_status:
+        print("[E] APK signing error %s" % sign_status)
 
     sign_verify = subprocess.check_output(["apksigner", "verify", "--verbose", signed_apk_path]).decode()
 
-    if not "Verified using v1 scheme (JAR signing): true" in sign_verify and not "Verified using v2 scheme (APK Signature Scheme v2): true" in sign_verify:
+    if "Verified using v1 scheme (JAR signing): true" not in sign_verify and "Verified using v2 scheme (APK Signature Scheme v2): true" not in sign_verify:
         print(sign_verify)
     else:
         print("[I] APK signature verified")
@@ -250,7 +267,7 @@ try:
     subprocess.call(["rm", new_apk_path, aligned_apk_path])
 
     if os.path.isfile(appmon_apk_path):
-        print("[I] Ready: %s" % (appmon_apk_path))
+        print("[I] Ready: %s" % appmon_apk_path)
 
 except Exception as e:
     traceback.print_exc()
