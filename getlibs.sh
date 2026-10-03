@@ -1,11 +1,20 @@
 #!/bin/bash
 
+VERSION="${1:-latest}"
+
 if [ -f lib.zip ]; then
   rm -rf lib.zip
 fi
 mkdir lib
 cd lib
-wget -qO - https://api.github.com/repos/frida/frida/releases/latest | grep -o "\/frida\/frida\/releases\/download\/.*\/frida-gadget-.*-android-.*\.so\.xz" | sed 's/\/frida\/frida/https:\/\/github\.com\/frida\/frida/g' | sed 's/%0A/\n/g' >list.txt
+
+if [ "$VERSION" = "latest" ]; then
+  API_URL="https://api.github.com/repos/frida/frida/releases/latest"
+else
+  API_URL="https://api.github.com/repos/frida/frida/releases/tags/${VERSION}"
+fi
+
+wget -qO - "$API_URL" | grep -o "\/frida\/frida\/releases\/download\/.*\/frida-gadget-.*-android-.*\.so\.xz" | sed 's/\/frida\/frida/https:\/\/github\.com\/frida\/frida/g' | sed 's/%0A/\n/g' >list.txt
 wget -i list.txt
 unxz *.xz
 mkdir arm64 arm64-v8a armeabi armeabi-v7a x86 x86_64
