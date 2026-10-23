@@ -84,6 +84,21 @@ BOOL_TRUE = 0xFFFFFFFF  # convention: any non-zero is true, aapt writes -1
 
 NO_INDEX = 0xFFFFFFFF
 
+RES_STRING_POOL_TYPE = 0x0001
+RES_TABLE_TYPE = 0x0002
+RES_TABLE_PACKAGE_TYPE = 0x0200
+RES_TABLE_TYPE_TYPE = 0x0201
+RES_TABLE_TYPE_SPEC_TYPE = 0x0202
+
+# ResTable_type.flags (a uint8 at offset 9 - offset 10 is the reserved u16)
+TYPE_FLAG_SPARSE = 0x01
+TYPE_FLAG_OFFSET16 = 0x02
+
+# ResTable_entry.flags
+ENTRY_FLAG_COMPLEX = 0x0001
+ENTRY_FLAG_COMPACT = 0x0008
+
+
 NSC_FILE_NAME = "network_security_config.xml"
 NSC_RES_NAME = "network_security_config"
 
@@ -137,49 +152,56 @@ def find_build_tools():
 class StringPool:
     def __init__(self):
         self.utf8 = True
-        self.strings = []
-        self._style_offsets = []  # u32 offsets into the spans block, verbatim
-        self._styles = b""  # raw span block incl. sentinel, kept verbatim
-        self._style_count = 0
+        self.sorted = False
+        self.strings = []  # decoded text, for lookups only - never re-encoded
+        self._data = b""  # original string data region, verbatim
+        self._offsets = []  # original string offsets into self._data
+        self._appended = []  # encoded entries (lengths + data + NUL) to add
+        self._style_offsets = []  # one per styled string, into self._styles
+        self._styles = b""  # raw span block incl. END sentinels, kept verbatim
+        self._flags_extra = 0  # unknown header flag bits, preserved
 
     @staticmethod
     def parse(data, off):
         pool = StringPool()
-        chunk_type, header_size = struct.unpack_from("<HH", data, off)
-        if chunk_type != 0x0001:
+        chunk_type, header_size, chunk_size = struct.unpack_from("<HHI", data, off)
+        if chunk_type != RES_STRING_POOL_TYPE:
             raise ValueError("expected string pool chunk, got 0x%04x" % chunk_type)
-        (chunk_size,) = struct.unpack_from("<I", data, off + 4)
         pool.size = chunk_size
         (str_count, style_count, flags, strings_start, styles_start) = struct.unpack_from(
             "<IIIII", data, off + 8
         )
         pool.utf8 = bool(flags & 0x100)
-        pool._style_count = style_count
-        offsets = struct.unpack_from("<%dI" % str_count, data, off + 28)
-        # LAYOUT GOTCHA (found on PCAPdroid, whose arsc global pool carries
-        # styled strings): the STYLE OFFSETS table is NOT at stylesStart -
-        # androidfw hardcodes it right after the string offsets, at
-        # headerSize + 4*stringCount; stylesStart points at the SPAN
-        # structures only. Pools without styles make both readings coincide,
-        # which is why the bug stayed hidden until a styled pool showed up.
-        if style_count > 0:
-            pool._style_offsets = list(
-                struct.unpack_from(
-                    "<%dI" % style_count, data, off + 28 + 4 * str_count
-                )
-            )
+        pool.sorted = bool(flags & 0x1)
+        pool._flags_extra = flags & ~0x101
+        offsets = struct.unpack_from("<%dI" % str_count, data, off + header_size)
+        # the style-offset array follows the string offsets (one byte offset
+        # into the span block per styled string)
+        pool._style_offsets = list(
+            struct.unpack_from("<%dI" % style_count, data, off + header_size + 4 * str_count)
+        )
+        # Keep the string data region as-is rather than re-encoding each
+        # string from its decoded text: aapt2 writes supplementary chars
+        # (emoji) as modified-UTF-8 surrogate pairs that decode to U+FFFD
+        # here, some producers emit non-canonical two-byte lengths (seen on
+        # Telecel Play 26.10.2 / com.myvodafone.app, a bundletool universal
+        # APK) and some share the bytes of identical strings (WireGuard's type
+        # pool) - a re-encode silently rewrites the first two and duplicates
+        # the last.
+        if str_count > 0:
+            region_end = styles_start if style_count > 0 else chunk_size
+            pool._data = bytes(data[off + strings_start : off + region_end])
+            pool._offsets = list(offsets)
         base = off + strings_start
         for o in offsets:
-            p = base + o
             if pool.utf8:
-                _, p = StringPool._decode_len8(data, p)
+                _, p = StringPool._decode_len8(data, base + o)
                 u8len, p = StringPool._decode_len8(data, p)
-                pool.strings.append(data[p : p + u8len].decode("utf-8", "replace"))
+                text = bytes(data[p : p + u8len]).decode("utf-8", "replace")
             else:
-                u16len, p = StringPool._decode_len16(data, p)
-                pool.strings.append(
-                    data[p : p + 2 * u16len].decode("utf-16-le", "replace")
-                )
+                u16len, p = StringPool._decode_len16(data, base + o)
+                text = bytes(data[p : p + 2 * u16len]).decode("utf-16-le", "replace")
+            pool.strings.append(text)
         if style_count > 0:
             pool._styles = bytes(data[off + styles_start : off + chunk_size])
         return pool
@@ -226,63 +248,75 @@ class StringPool:
         if idx >= 0:
             return idx
         self.strings.append(s)
+        self._appended.append(self._encode_string(s))
+        # an appended string breaks sort order; unsorted pools are always
+        # legal (lookups fall back to a linear scan)
+        self.sorted = False
         return len(self.strings) - 1
 
     def _encode_string(self, s):
         # aapt measures length in UTF-16 code units, not code points
-        u16len = len(s.encode("utf-16-le")) // 2
+        u16 = s.encode("utf-16-le")
+        u16len = len(u16) // 2
         if self.utf8:
             raw = s.encode("utf-8")
+            if max(u16len, len(raw)) > 0x7FFF:  # two-byte length limit
+                raise ValueError("string too long for a UTF-8 pool: %r..." % s[:40])
             return self._encode_len8(u16len) + self._encode_len8(len(raw)) + raw + b"\x00"
-        return self._encode_len16(u16len) + s.encode("utf-16-le") + b"\x00\x00"
+        return self._encode_len16(u16len) + u16 + b"\x00\x00"
 
     def serialize(self):
-        # The SORTED flag (0x1) is dropped on rewrite: appended strings would
-        # break sort order, and unsorted pools are always legal (lookups fall
-        # back to a linear scan).
-        flags = 0x100 if self.utf8 else 0x0
-        enc = [self._encode_string(s) for s in self.strings]
-        count = len(self.strings)
-        # [header][string offsets][style offsets][strings][spans] - see the
-        # layout note in parse(); the style offsets table must be re-emitted
-        # in its hardcoded slot even though stylesStart points elsewhere.
-        strings_start = 28 + 4 * count + 4 * len(self._style_offsets)
-        strings_start += (-strings_start) % 4
-        if self._style_count > 0:
-            styles_start = strings_start + sum(len(e) for e in enc)
-            styles_start += (-styles_start) % 4  # spans need 4-byte alignment
+        # aapt2 layout: header | string offsets | STYLE offsets | string data
+        # | span block. The style-offset array is the easy one to lose: an
+        # earlier revision dropped it, so the platform read style offsets out
+        # of the string data and rejected the whole table ("Bad string block:
+        # style offsets extend past style data start" / "RES_STRING_POOL_TYPE
+        # corrupt" -> INSTALL_PARSE_FAILED_NOT_APK: Failed to load asset path)
+        # for every app with a styled string resource.
+        offsets = list(self._offsets)
+        data = bytearray(self._data)
+        for e in self._appended:
+            offsets.append(len(data))
+            data += e
+        data += b"\x00" * (-len(data) % 4)  # spans need 4-byte alignment
+        count = len(offsets)
+        style_count = len(self._style_offsets)
+        flags = self._flags_extra | (0x100 if self.utf8 else 0) | (0x1 if self.sorted else 0)
+        strings_start = 28 + 4 * (count + style_count)
+        if style_count > 0:
+            styles_start = strings_start + len(data)
+            # no tail padding: the span block must END the chunk - the
+            # platform checks its last 12 bytes are the 0xFFFFFFFF sentinels
             chunk_size = styles_start + len(self._styles)
         else:
             styles_start = 0
-            chunk_size = strings_start + sum(len(e) for e in enc)
-        chunk_size += (-chunk_size) % 4
+            chunk_size = strings_start + len(data)
         out = bytearray(
             struct.pack(
                 "<HHIIIIII",
-                0x0001,
+                RES_STRING_POOL_TYPE,
                 28,
                 chunk_size,
                 count,
-                self._style_count,
+                style_count,
                 flags,
                 strings_start,
                 styles_start,
             )
         )
-        cur = 0
-        for e in enc:
-            out += struct.pack("<I", cur)
-            cur += len(e)
-        for so in self._style_offsets:
-            out += struct.pack("<I", so)
-        out += b"\x00" * (strings_start - len(out))
-        for e in enc:
-            out += e
-        if self._style_count > 0:
-            out += b"\x00" * (styles_start - len(out))
-            out += self._styles
-        out += b"\x00" * (chunk_size - len(out))
+        out += struct.pack("<%dI" % count, *offsets)
+        out += struct.pack("<%dI" % style_count, *self._style_offsets)
+        out += data
+        out += self._styles
         return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# Binary XML (AXML) editing: parse the manifest, splice attributes into
+# <application>, re-serialize with a fresh string pool / resource map.
+# Original string indices are preserved (pool rebuilt in order, appends only),
+# so every untouched node and every style span keeps working.
+# ---------------------------------------------------------------------------
 
 
 class AxmlNode:
@@ -319,23 +353,24 @@ class AxmlDocument:
             (chunk_size,) = struct.unpack_from("<I", data, off + 4)
             line = struct.unpack_from("<I", data, off + 8)[0]
             comment = struct.unpack_from("<I", data, off + 12)[0]
+            ext = off + chunk_hdr  # node payload follows the (16-byte) node header
             if chunk_type == 0x0001:
                 self.pool = StringPool.parse(data, off)
             elif chunk_type == 0x0180:
                 n = (chunk_size - chunk_hdr) // 4
                 self.res_ids = list(struct.unpack_from("<%dI" % n, data, off + chunk_hdr))
             elif chunk_type in (AxmlNode.START_NS, AxmlNode.END_NS):
-                prefix, uri = struct.unpack_from("<II", data, off + 16)
+                prefix, uri = struct.unpack_from("<II", data, ext)
                 self.nodes.append(
                     dict(kind=chunk_type, line=line, comment=comment, prefix=prefix, uri=uri)
                 )
             elif chunk_type == AxmlNode.START_ELEMENT:
-                ns, name = struct.unpack_from("<II", data, off + 16)
+                ns, name = struct.unpack_from("<II", data, ext)
                 attr_start, attr_size, attr_count, id_idx, class_idx, style_idx = struct.unpack_from(
-                    "<HHHHHH", data, off + 24
+                    "<HHHHHH", data, ext + 8
                 )
                 attrs = []
-                abase = off + 16 + attr_start
+                abase = ext + attr_start
                 for i in range(attr_count):
                     a = abase + i * attr_size
                     ans, aname, raw = struct.unpack_from("<III", data, a)
@@ -357,11 +392,17 @@ class AxmlDocument:
                     )
                 )
             elif chunk_type == AxmlNode.END_ELEMENT:
-                ns, name = struct.unpack_from("<II", data, off + 16)
+                ns, name = struct.unpack_from("<II", data, ext)
                 self.nodes.append(dict(kind=chunk_type, line=line, comment=comment, ns=ns, name=name))
             elif chunk_type == AxmlNode.CDATA:
-                (cdata,) = struct.unpack_from("<I", data, off + 16)
-                self.nodes.append(dict(kind=chunk_type, line=line, comment=comment, data=cdata))
+                # ResXMLTree_cdataExt: string ref + an 8-byte typed Res_value.
+                # Dropping typedData leaves a node the platform rejects
+                # ("Bad XML block: header type 0x104 ... has size 4, need 12").
+                (cdata,) = struct.unpack_from("<I", data, ext)
+                typed = bytes(data[ext + 4 : ext + 12])
+                self.nodes.append(
+                    dict(kind=chunk_type, line=line, comment=comment, data=cdata, typed=typed)
+                )
             else:
                 # unknown chunk kind: keep bytes verbatim
                 self.nodes.append(dict(kind=chunk_type, raw=bytes(data[off : off + chunk_size])))
@@ -461,7 +502,7 @@ class AxmlDocument:
         if k in (AxmlNode.START_NS, AxmlNode.END_NS):
             return self._node_header(n, 8) + struct.pack("<II", n["prefix"], n["uri"])
         if k == AxmlNode.CDATA:
-            return self._node_header(n, 4) + struct.pack("<I", n["data"])
+            return self._node_header(n, 12) + struct.pack("<I", n["data"]) + n["typed"]
         if k == AxmlNode.END_ELEMENT:
             return self._node_header(n, 8) + struct.pack("<II", n["ns"], n["name"])
         if k == AxmlNode.START_ELEMENT:
@@ -561,51 +602,71 @@ def compile_xml_to_axml(text):
 # ---------------------------------------------------------------------------
 
 
+def _iter_chunks(data, start, end):
+    """Yield (offset, type, raw bytes) for each chunk in data[start:end]."""
+    c = start
+    while c < end:
+        ctype, chdr, csize = struct.unpack_from("<HHI", data, c)
+        if chdr < 8 or chdr > csize or c + csize > end:
+            raise ValueError("malformed chunk 0x%04x at offset %d" % (ctype, c))
+        yield c, ctype, bytes(data[c : c + csize])
+        c += csize
+
+
 class ArscPackage:
     def __init__(self, data, off):
-        self.off = off
         (self.chunk_type, self.header_size, self.size, self.id) = struct.unpack_from(
             "<HHII", data, off
         )
-        self.raw_name = bytes(data[off + 12 : off + 268])  # 128 UTF-16 units, verbatim
+        # fixed header kept verbatim (name, and typeIdOffset when present -
+        # old aapt wrote 284-byte headers without it); serialize() patches
+        # only the size and string-pool fields
+        self.raw_header = bytes(data[off : off + self.header_size])
         (
-            self.type_strings_off,
+            type_strings_off,
             self.last_public_type,
-            self.key_strings_off,
+            key_strings_off,
             self.last_public_key,
-            self.type_id_offset,
-        ) = struct.unpack_from("<IIIII", data, off + 268)
-        self.type_pool = StringPool.parse(data, off + self.type_strings_off)
-        self.key_pool = StringPool.parse(data, off + self.key_strings_off)
-        # type spec/type chunks follow the key strings pool (the two string
-        # pools sit between the fixed header and them); keep them in original
-        # order. Parsed dicts carry enough state to rebuild a modified chunk,
-        # raw bytes are copied verbatim otherwise.
+        ) = struct.unpack_from("<IIII", data, off + 268)
+        # Children: the type/key string pools - located by their header
+        # offsets, exactly as LoadedPackage::Load does - and every other
+        # chunk in original order. Type and type-spec chunks carry enough
+        # parsed state to rebuild them; all chunks keep raw bytes, so
+        # untouched ones (library, overlayable, staged-alias ...) are copied
+        # verbatim.
+        self.type_pool = self.key_pool = None
         self.chunks = []
-        c = off + self.key_strings_off + self.key_pool.size
-        end = off + self.size
-        while c < end:
-            ctype, chdr = struct.unpack_from("<HH", data, c)
-            (csize,) = struct.unpack_from("<I", data, c + 4)
-            entry = dict(kind=ctype, raw=bytes(data[c : c + csize]))
-            if ctype in (0x0201, 0x0204):
-                flags = struct.unpack_from("<H", data, c + 10)[0]
-                entry.update(
-                    dict(
-                        type_id=data[c + 8],
-                        flags=flags,
-                        entry_count=struct.unpack_from("<I", data, c + 12)[0],
-                        entries_start=struct.unpack_from("<I", data, c + 16)[0],
-                        config_size=struct.unpack_from("<I", data, c + 20)[0],
-                        header_size=chdr,
-                        is_sparse=(ctype == 0x0204 or bool(flags & 0x01)),
-                        is_off16=bool(flags & 0x02),
-                    )
-                )
-            elif ctype == 0x0202:
-                entry.update(dict(type_id=data[c + 8]))
-            self.chunks.append(entry)
-            c += csize
+        for c, ctype, raw in _iter_chunks(data, off + self.header_size, off + self.size):
+            if c - off == type_strings_off:
+                self.type_pool = StringPool.parse(data, c)
+            elif c - off == key_strings_off:
+                self.key_pool = StringPool.parse(data, c)
+            elif ctype == RES_TABLE_TYPE_TYPE:
+                self.chunks.append(self._parse_type_chunk(raw))
+            elif ctype == RES_TABLE_TYPE_SPEC_TYPE:
+                self.chunks.append(dict(kind=ctype, type_id=raw[8], raw=raw))
+            else:
+                self.chunks.append(dict(kind=ctype, raw=raw))
+        if self.type_pool is None or self.key_pool is None:
+            raise ValueError("package 0x%02x has no type/key string pool" % self.id)
+
+    @staticmethod
+    def _parse_type_chunk(raw):
+        # ResTable_type: {hdr(8), u8 id, u8 flags, u16 reserved, u32
+        # entryCount, u32 entriesStart} + ResTable_config up to headerSize.
+        # flags is the u8 at offset 9: reading a u16 at offset 10 (as an
+        # earlier revision did) hits the reserved field, so sparse/offset16
+        # tables were walked as dense uint32 ones.
+        entry_count, entries_start = struct.unpack_from("<II", raw, 12)
+        return dict(
+            kind=RES_TABLE_TYPE_TYPE,
+            type_id=raw[8],
+            flags=raw[9],
+            header_size=struct.unpack_from("<H", raw, 2)[0],
+            entry_count=entry_count,
+            entries_start=entries_start,
+            raw=raw,
+        )
 
     def type_index(self, type_name):
         try:
@@ -617,80 +678,68 @@ class ArscPackage:
         return [
             c
             for c in self.chunks
-            if c.get("type_id") == type_id and c["kind"] in (0x0201, 0x0204)
+            if c["kind"] == RES_TABLE_TYPE_TYPE and c["type_id"] == type_id
         ]
 
     def type_spec(self, type_id):
         for c in self.chunks:
-            if c["kind"] == 0x0202 and c.get("type_id") == type_id:
+            if c["kind"] == RES_TABLE_TYPE_SPEC_TYPE and c["type_id"] == type_id:
                 return c
         return None
 
+    def _resid(self, type_id, entry_idx):
+        return (self.id << 24) | (type_id << 16) | entry_idx
+
     @staticmethod
     def is_default_config(chunk):
-        # default config = every qualifier byte zero. The first 4 bytes of the
-        # region are ResTable_config.size itself (always non-zero), so compare
-        # only the qualifier payload after it.
-        region = chunk["raw"][20 : 20 + chunk["config_size"]]
-        return region[4:] == b"\x00" * (len(region) - 4)
-
-    def _iter_entries(self, chunk):
-        """Yield (entry_index, byte_offset_into_entries_data) for present entries."""
-        raw = chunk["raw"]
-        hdr = chunk["header_size"]
-        n = chunk["entry_count"]
-        if n <= 0 or len(raw) <= hdr:
-            return
-        if chunk["is_sparse"]:
-            count = (len(raw) - hdr) // 4
-            vals = struct.unpack_from("<%dH" % (2 * count), raw, hdr)
-            for i in range(count):
-                yield vals[2 * i], vals[2 * i + 1] * 4  # sparse offsets are /4
-        elif chunk["is_off16"]:
-            offs = struct.unpack_from("<%dH" % (2 * n), raw, hdr)
-            for i in range(n):
-                off = offs[2 * i] | (offs[2 * i + 1] << 16)
-                if off != NO_INDEX:
-                    yield i, off * 4
-        else:
-            offs = struct.unpack_from("<%dI" % n, raw, hdr)
-            for i in range(n):
-                if offs[i] != NO_INDEX:
-                    yield i, offs[i]
+        # default config = every qualifier byte zero. The config starts at
+        # offset 20 with ResTable_config.size itself (always non-zero), so
+        # compare only the qualifier payload after it.
+        return not any(chunk["raw"][24 : chunk["header_size"]])
 
     @staticmethod
-    def _entry_total_len(raw, p):
-        """Byte length of the entry at raw[p] (simple or complex/bag)."""
-        esize, eflags = struct.unpack_from("<HH", raw, p)
-        if eflags & 0x01:  # COMPLEX: maps follow (20 bytes each)
-            count = struct.unpack_from("<I", raw, p + 12)[0]
-            return esize + count * 20
-        return esize + 8  # + Res_value
+    def _iter_entries(chunk):
+        """Yield (entry_index, byte offset from entriesStart) for present entries."""
+        raw, hdr, n = chunk["raw"], chunk["header_size"], chunk["entry_count"]
+        if chunk["flags"] & TYPE_FLAG_SPARSE:
+            # entryCount ResTable_sparseTypeEntry {u16 idx, u16 offset / 4},
+            # sorted by idx - entryCount counts PRESENT entries, not indices
+            vals = struct.unpack_from("<%dH" % (2 * n), raw, hdr)
+            for i in range(n):
+                yield vals[2 * i], vals[2 * i + 1] * 4
+        elif chunk["flags"] & TYPE_FLAG_OFFSET16:
+            # one u16 per index: offset / 4, 0xFFFF = no entry
+            for i, o in enumerate(struct.unpack_from("<%dH" % n, raw, hdr)):
+                if o != 0xFFFF:
+                    yield i, o * 4
+        else:
+            for i, o in enumerate(struct.unpack_from("<%dI" % n, raw, hdr)):
+                if o != NO_INDEX:
+                    yield i, o
 
-    def _entry_value(self, chunk, entry_index):
-        """(dataType, data) of a simple entry, or None for bags."""
-        raw = chunk["raw"]
-        es = chunk["entries_start"]
-        for i, off in self._iter_entries(chunk):
-            if i == entry_index:
-                p = es + off
-                eflags = struct.unpack_from("<H", raw, p + 2)[0]
-                if eflags & 0x01:
-                    return None
-                esize = struct.unpack_from("<H", raw, p)[0]
-                vsize, vres0, vtype, vdata = struct.unpack_from("<HBBI", raw, p + esize)
-                return (vtype, vdata)
-        return None
+    @staticmethod
+    def _entry_value(raw, p):
+        """(dataType, data) of the simple entry at raw[p], or None for bags."""
+        esize, eflags = struct.unpack_from("<HH", raw, p)
+        if eflags & ENTRY_FLAG_COMPACT:
+            # compact entry (aapt2 --enable-compact-entries): {u16 key, u16
+            # flags with the dataType in the high byte, u32 data}
+            return (eflags >> 8, struct.unpack_from("<I", raw, p + 4)[0])
+        if eflags & ENTRY_FLAG_COMPLEX:
+            return None
+        vsize, vres0, vtype, vdata = struct.unpack_from("<HBBI", raw, p + esize)
+        return (vtype, vdata)
 
     def entry_file_paths(self, type_id, global_pool):
-        """All file-backed entries of a type: {resource_id: file_path}."""
-        out = {}
+        """All file-backed entries of a type across every config chunk, as
+        [(resource_id, file_path)] - one id can map to several files
+        (res/xml/x.xml, res/xml-v24/x.xml ...)."""
+        out = []
         for chunk in self.type_chunks(type_id):
-            for i, _ in self._iter_entries(chunk):
-                value = self._entry_value(chunk, i)
+            for i, off in self._iter_entries(chunk):
+                value = self._entry_value(chunk["raw"], chunk["entries_start"] + off)
                 if value and value[0] == VAL_TYPE_STRING:
-                    rid = (self.id << 24) | (type_id << 16) | i
-                    out[rid] = global_pool.strings[value[1]]
+                    out.append((self._resid(type_id, i), global_pool.strings[value[1]]))
         return out
 
     def append_file_entry(self, type_id, key_name, file_path, global_pool):
@@ -698,164 +747,175 @@ class ArscPackage:
 
         The entry goes into the type's DEFAULT-config chunk (created if
         absent). The new entry index is one beyond the highest index used by
-        ANY config chunk of the type, so an exact-id lookup can never resolve
-        to another config chunk that also happens to contain that index.
+        the type spec or ANY config chunk of the type, so an exact-id lookup
+        can never resolve to another config chunk that also happens to
+        contain that index.
         """
         global_idx = global_pool.append(file_path)
         key_idx = self.key_pool.append(key_name)
+        entry_idx = self._entry_index_bound(type_id)
+        if entry_idx > 0xFFFF:
+            raise ValueError("type 0x%02x has no free entry index" % type_id)
 
-        chunks = self.type_chunks(type_id)
-        entry_idx = max([c["entry_count"] for c in chunks] + [0])
-        host = None
-        for c in chunks:
-            if self.is_default_config(c):
-                host = c
-                break
-        if host is None:
-            host = dict(
-                kind=0x0201,
+        spec = self.type_spec(type_id)
+        new_type = spec is None
+        if new_type:
+            if self.type_chunks(type_id):
+                raise ValueError("type 0x%02x has config chunks but no type spec" % type_id)
+            # TYPE_SPEC: {hdr(8), u8 id, u8 res0, u16 typesCount, u32
+            # entryCount} + per-entry flags (grown below). It must PRECEDE
+            # the type's config chunks: LoadedPackage::Load rejects a type
+            # chunk without an earlier spec of the same id.
+            spec = dict(
+                kind=RES_TABLE_TYPE_SPEC_TYPE,
                 type_id=type_id,
-                flags=0,
-                entry_count=0,
-                entries_start=0,
-                config_size=64,
-                header_size=84,
-                is_sparse=False,
-                is_off16=False,
-                raw=b"",  # empty config region -> written as default config
+                raw=struct.pack("<HHIBBHI", RES_TABLE_TYPE_SPEC_TYPE, 16, 16, type_id, 0, 1, 0),
             )
-            self.chunks.append(host)
-            if self.type_spec(type_id) is None:
-                # TYPE_SPEC: {hdr(8), id, res0, flags, entryCount} + flags array
-                n = entry_idx + 1
-                self.chunks.append(
-                    dict(
-                        kind=0x0202,
-                        type_id=type_id,
-                        raw=struct.pack("<HHIBBHI", 0x0202, 16, 16 + 4 * n, type_id, 0, 0, n)
-                        + b"\x00" * (4 * n),
-                    )
-                )
+            self.chunks.append(spec)
+        host = next((c for c in self.type_chunks(type_id) if self.is_default_config(c)), None)
+        if host is None:
+            host = self._new_default_type_chunk(type_id)
+            # keep the type's chunks together, right after its last one
+            last = max(i for i, c in enumerate(self.chunks) if c.get("type_id") == type_id)
+            self.chunks.insert(last + 1, host)
+            if not new_type:
+                self._bump_types_count(spec)
 
         entry = struct.pack("<HHI", 8, 0, key_idx) + struct.pack(
             "<HBBI", 8, 0, VAL_TYPE_STRING, global_idx
         )
-        new_raw, new_count = self._rebuild_type_chunk(host, entry_idx, entry)
-        host["raw"] = new_raw
-        host["entry_count"] = new_count
-
-        spec = self.type_spec(type_id)
-        if spec is not None and len(spec["raw"]) >= 16:
-            n = struct.unpack_from("<I", spec["raw"], 12)[0]
-            if n < host["entry_count"]:
-                # grow the entry-flag array to match the new entry count;
-                # rebuild the whole chunk so the size field stays truthful
-                # (a stale size makes aapt2/framework walk chunks misaligned)
-                spec["raw"] = (
-                    struct.pack(
-                        "<HHIBBHI",
-                        0x0202,
-                        16,
-                        16 + 4 * host["entry_count"],
-                        type_id,
-                        0,
-                        0,
-                        host["entry_count"],
-                    )
-                    + spec["raw"][16:]
-                    + b"\x00" * (4 * (host["entry_count"] - n))
-                )
+        self._add_entry(host, entry_idx, entry)
+        self._grow_spec(spec, entry_idx + 1)
 
         self.last_public_type = max(self.last_public_type, type_id)
         self.last_public_key = max(self.last_public_key, key_idx)
-        return (self.id << 24) | (type_id << 16) | entry_idx
+        return self._resid(type_id, entry_idx)
 
-    def _rebuild_type_chunk(self, chunk, entry_idx, entry_bytes):
-        """Rebuild a type chunk with one more entry.
-
-        Sparse (0x0204) and OFFSET16 chunks are converted to the plain uint32
-        offset layout - always valid and the simplest shape to extend. Existing
-        entries are copied verbatim; gaps stay as NO_INDEX holes (dense chunks
-        with holes are exactly what aapt emits for sparse key spaces).
-        """
-        raw = chunk["raw"]
-        n = chunk["entry_count"]
-        config = raw[20 : 20 + chunk["config_size"]]
-        hdr_size = 20 + len(config)
-
-        entries = {}
-        for i, off in self._iter_entries(chunk):
-            p = chunk["entries_start"] + off
-            entries[i] = raw[p : p + self._entry_total_len(raw, p)]
-
-        new_count = max(n, entry_idx + 1)
-        offsets = []
-        data = bytearray()
-        for i in range(new_count):
-            if i in entries:
-                offsets.append(len(data))
-                data += entries[i]
-            elif i == entry_idx:
-                offsets.append(len(data))
-                data += entry_bytes
+    def _entry_index_bound(self, type_id):
+        """One past the highest entry index the spec or any config chunk covers."""
+        spec = self.type_spec(type_id)
+        bound = struct.unpack_from("<I", spec["raw"], 12)[0] if spec else 0
+        for chunk in self.type_chunks(type_id):
+            if chunk["flags"] & TYPE_FLAG_SPARSE:
+                # sparse entryCount counts present entries, not the index space
+                bound = max([bound] + [i + 1 for i, _ in self._iter_entries(chunk)])
             else:
-                offsets.append(NO_INDEX)
-        entries_start = hdr_size + 4 * new_count
+                bound = max(bound, chunk["entry_count"])
+        return bound
+
+    @staticmethod
+    def _new_default_type_chunk(type_id):
+        # An empty chunk for the default config: the 20-byte fixed header plus
+        # a zeroed 64-byte ResTable_config whose leading size field says 64.
+        # (An earlier revision emitted no config at all - a 20-byte header the
+        # platform rejects as "RES_TABLE_TYPE_TYPE too small".)
+        hdr = 20 + 64
+        raw = struct.pack("<HHIBBHII", RES_TABLE_TYPE_TYPE, hdr, hdr, type_id, 0, 0, 0, hdr)
+        raw += struct.pack("<I", 64) + b"\x00" * 60
+        return ArscPackage._parse_type_chunk(raw)
+
+    def _add_entry(self, chunk, entry_idx, entry_bytes):
+        """Rebuild a type chunk in place with one more entry.
+
+        Existing entry data is kept as one verbatim blob and only the offset
+        table is rewritten, so entries are never re-encoded - compact,
+        complex/bag or otherwise unusual entries survive untouched. Sparse
+        and OFFSET16 tables are widened to the plain dense uint32 layout:
+        valid on every API level and the simplest shape to extend; gaps
+        become NO_INDEX holes (exactly what aapt emits for sparse key spaces).
+        """
+        raw, hdr = chunk["raw"], chunk["header_size"]
+        offsets = dict(self._iter_entries(chunk))
+        if entry_idx in offsets:
+            raise ValueError("entry index %d already in use" % entry_idx)
+        data = bytearray(raw[chunk["entries_start"] :])
+        data += b"\x00" * (-len(data) % 4)  # entries must be 4-byte aligned
+        offsets[entry_idx] = len(data)
+        data += entry_bytes
+
+        count = max(offsets) + 1
+        if not chunk["flags"] & TYPE_FLAG_SPARSE:
+            count = max(count, chunk["entry_count"])
+        entries_start = hdr + 4 * count
         entries_start += (-entries_start) % 4
-        chunk_size = entries_start + len(data)
-        chunk_size += (-chunk_size) % 4
-        out = bytearray(
-            struct.pack(
-                "<HHIBBHII",
-                0x0201,
-                hdr_size,
-                chunk_size,
-                chunk["type_id"],
-                0,
-                0,  # flags: not sparse, not offset16
-                new_count,
-                entries_start,
-            )
-        )
-        out += config
-        out += b"".join(struct.pack("<I", o) for o in offsets)
+        out = bytearray(raw[:hdr])  # fixed header + ResTable_config, verbatim
+        out[9] = chunk["flags"] & ~(TYPE_FLAG_SPARSE | TYPE_FLAG_OFFSET16)
+        struct.pack_into("<II", out, 12, count, entries_start)
+        out += struct.pack("<%dI" % count, *(offsets.get(i, NO_INDEX) for i in range(count)))
         out += b"\x00" * (entries_start - len(out))
         out += data
-        out += b"\x00" * (chunk_size - len(out))
-        return bytes(out), new_count
+        out += b"\x00" * (-len(out) % 4)
+        struct.pack_into("<I", out, 4, len(out))
+        chunk.update(self._parse_type_chunk(bytes(out)))
+
+    @staticmethod
+    def _grow_spec(spec, count):
+        # grow the per-entry flag array to `count` entries; rebuild the whole
+        # chunk so the size field stays truthful (a stale size makes
+        # aapt2/framework walk chunks misaligned)
+        raw = spec["raw"]
+        hdr = struct.unpack_from("<H", raw, 2)[0]
+        n = struct.unpack_from("<I", raw, 12)[0]
+        if n >= count:
+            return
+        out = bytearray(raw[: hdr + 4 * n]) + b"\x00" * (4 * (count - n))
+        struct.pack_into("<I", out, 4, len(out))
+        struct.pack_into("<I", out, 12, count)
+        spec["raw"] = bytes(out)
+
+    @staticmethod
+    def _bump_types_count(spec):
+        # ResTable_typeSpec.typesCount (u16 at offset 10, formerly reserved):
+        # when non-zero it counts the type's config chunks
+        raw = bytearray(spec["raw"])
+        n = struct.unpack_from("<H", raw, 10)[0]
+        if n:
+            struct.pack_into("<H", raw, 10, n + 1)
+            spec["raw"] = bytes(raw)
 
     def serialize(self):
         tp = self.type_pool.serialize()
         kp = self.key_pool.serialize()
         body = tp + kp + b"".join(c["raw"] for c in self.chunks)
-        header = struct.pack("<HHII", 0x0200, self.header_size, self.header_size + len(body), self.id)
-        header += self.raw_name
-        header += struct.pack(
-            "<IIIII",
+        header = bytearray(self.raw_header)
+        struct.pack_into("<I", header, 4, self.header_size + len(body))
+        struct.pack_into(
+            "<IIII",
+            header,
+            268,
             self.header_size,  # typeStrings starts right after the fixed header
             self.last_public_type,
             self.header_size + len(tp),  # keyStrings after the type pool
             self.last_public_key,
-            self.type_id_offset,
         )
-        return header + body
+        return bytes(header) + body
 
 
 class ArscTable:
     def __init__(self, data):
-        self.data = bytes(data)
-        (self.chunk_type, self.header_size, self.size, self.package_count) = struct.unpack_from(
-            "<HHII", self.data, 0
+        data = bytes(data)
+        (chunk_type, self.header_size, size, self.package_count) = struct.unpack_from(
+            "<HHII", data, 0
         )
-        if self.chunk_type != 0x0002:
-            raise ValueError("not a resources.arsc table (type=0x%04x)" % self.chunk_type)
-        self.global_pool = StringPool.parse(self.data, self.header_size)
+        if chunk_type != RES_TABLE_TYPE:
+            raise ValueError("not a resources.arsc table (type=0x%04x)" % chunk_type)
+        self.raw_header = data[: self.header_size]
+        # children in original order: the global string pool (the first pool,
+        # as LoadedArsc uses), the packages, anything else verbatim
+        self.global_pool = None
         self.packages = []
-        off = self.header_size + struct.unpack_from("<I", self.data, self.header_size + 4)[0]
-        for _ in range(self.package_count):
-            pkg = ArscPackage(self.data, off)
-            self.packages.append(pkg)
-            off += pkg.size
+        self.children = []
+        for c, ctype, raw in _iter_chunks(data, self.header_size, min(size, len(data))):
+            if ctype == RES_STRING_POOL_TYPE and self.global_pool is None:
+                child = self.global_pool = StringPool.parse(data, c)
+            elif ctype == RES_TABLE_PACKAGE_TYPE:
+                child = ArscPackage(data, c)
+                self.packages.append(child)
+            else:
+                child = raw
+            self.children.append(child)
+        if self.global_pool is None:
+            raise ValueError("resources.arsc has no global string pool")
 
     def app_package(self):
         # the manifest resolves refs against the app's own package (0x7f);
@@ -866,11 +926,15 @@ class ArscTable:
         return self.packages[0] if self.packages else None
 
     def serialize(self):
-        body = self.global_pool.serialize() + b"".join(p.serialize() for p in self.packages)
-        header = struct.pack(
-            "<HHII", 0x0002, self.header_size, self.header_size + len(body), self.package_count
-        )
-        return header + body
+        body = b"".join(c if isinstance(c, bytes) else c.serialize() for c in self.children)
+        header = bytearray(self.raw_header)
+        struct.pack_into("<I", header, 4, self.header_size + len(body))
+        return bytes(header) + body
+
+
+# ---------------------------------------------------------------------------
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -997,16 +1061,18 @@ def apply_zip_surgery(apk_path, out_path, add_extract_native_libs=True):
 
     resid = None
     type_id = pkg.type_index("xml")
-    if type_id > 0:
-        for rid, path in pkg.entry_file_paths(type_id, arsc.global_pool).items():
-            # startswith so re-runs over our own (or APKProxyHelper's)
-            # suffixed entries reuse them instead of appending _appmon_appmon
-            if os.path.basename(path).startswith(NSC_RES_NAME):
-                resid = rid
-                nsc_zip_path = path
-                break
+    files = pkg.entry_file_paths(type_id, arsc.global_pool) if type_id > 0 else []
+    for rid, path in files:
+        # startswith so re-runs over our own (or APKProxyHelper's)
+        # suffixed entries reuse them instead of appending _appmon_appmon
+        if os.path.basename(path).startswith(NSC_RES_NAME):
+            resid = rid
+            break
     if resid is not None:
-        print("[I]     reusing existing resource 0x%08x (%s)" % (resid, nsc_zip_path))
+        # every config variant (res/xml-v24/... etc.) gets the debug
+        # config: a more specific variant left untouched wins at runtime
+        nsc_zip_paths = sorted({path for rid, path in files if rid == resid})
+        print("[I]     reusing existing resource 0x%08x (%s)" % (resid, ", ".join(nsc_zip_paths)))
     else:
         key = NSC_RES_NAME
         while key in pkg.key_pool.strings:
@@ -1019,7 +1085,7 @@ def apply_zip_surgery(apk_path, out_path, add_extract_native_libs=True):
             # register the "xml" type name; its type index = pool pos + 1
             type_id = pkg.type_pool.append("xml") + 1
         resid = pkg.append_file_entry(type_id, key, path, arsc.global_pool)
-        nsc_zip_path = path
+        nsc_zip_paths = [path]
         print("[I]     added resource 0x%08x -> %s" % (resid, path))
     patched_arsc = arsc.serialize()
     nsc_payload = compile_xml_to_axml(load_nsc_text())
@@ -1031,7 +1097,7 @@ def apply_zip_surgery(apk_path, out_path, add_extract_native_libs=True):
     if not apps:
         raise ValueError("manifest has no <application> element")
     app = apps[0]
-    raw_ref = "@xml/" + os.path.splitext(os.path.basename(nsc_zip_path))[0]
+    raw_ref = "@xml/" + os.path.splitext(os.path.basename(nsc_zip_paths[0]))[0]
     if ensure_internet_permission(doc):
         print("[I]     added INTERNET permission")
     # All attrs required for reliable instrumentation:
@@ -1063,7 +1129,7 @@ def apply_zip_surgery(apk_path, out_path, add_extract_native_libs=True):
             elif name == "resources.arsc":
                 # API 30+ requires resources.arsc stored uncompressed
                 payload, method = patched_arsc, zipfile.ZIP_STORED
-            elif name == nsc_zip_path:
+            elif name in nsc_zip_paths:
                 payload, method = nsc_payload, zipfile.ZIP_DEFLATED
             else:
                 payload, method = zin.read(name), info.compress_type
@@ -1071,10 +1137,11 @@ def apply_zip_surgery(apk_path, out_path, add_extract_native_libs=True):
             zi.compress_type = method
             zi.external_attr = info.external_attr
             zout.writestr(zi, payload)
-        if nsc_zip_path not in names:
-            zi = zipfile.ZipInfo(nsc_zip_path, date_time=(2024, 1, 1, 0, 0, 0))
-            zi.compress_type = zipfile.ZIP_DEFLATED
-            zout.writestr(zi, nsc_payload)
+        for path in nsc_zip_paths:
+            if path not in names:
+                zi = zipfile.ZipInfo(path, date_time=(2024, 1, 1, 0, 0, 0))
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                zout.writestr(zi, nsc_payload)
     zin.close()
 
 

@@ -1,3 +1,5 @@
 *.apk
 *.apk.idsig
 lib.zip
+__pycache__/
+*.py[cod]
